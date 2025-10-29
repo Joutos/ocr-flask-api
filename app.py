@@ -27,7 +27,7 @@ def ocr_pdf():
         ])
         
         result = subprocess.run([
-            "ocrmypdf", "-l", "por",
+            "ocrmypdf", "-l", "por", '--force-ocr',
             unsigned_path, output_path
         ])
 
