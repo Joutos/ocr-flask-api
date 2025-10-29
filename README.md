@@ -30,4 +30,28 @@ Esta aplicação‑microserviço fornece um endpoint HTTP para receber documento
 git clone https://github.com/Joutos/ocr-flask-api.git
 cd ocr-flask-api
 docker build -t ocr-flask-api .
-docker run --rm -p 5000:5000 ocr-flask-api
+docker run --rm -p 8080:8080 ocr-flask-api
+```
+
+### Endpoint
+
+```/ocr```:
+
+#### Método: `POST`
+Endpoint responsável por processar o OCR de um arquivo PDF enviado via `multipart/form-data`.
+
+#### Requisição
+- **URL:** `http://localhost:8080/ocr`
+- **Método:** `POST`
+- **Content-Type:** `multipart/form-data`
+- **Parâmetros do corpo (Body):**
+  | Campo  | Tipo             | Obrigatório | Descrição                                   |
+  | ------ | ---------------- | ----------- | ------------------------------------------- |
+  | `file` | Arquivo (`.pdf`) | ✅           | O arquivo PDF que será processado pelo OCR. |
+
+#### Exemplo via cURL
+```bash
+curl -X POST http://localhost:8080/ocr \
+  -F "file=@/caminho/para/teste imagem.pdf" \
+  --output output.pdf
+  ```
