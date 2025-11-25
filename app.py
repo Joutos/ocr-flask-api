@@ -28,16 +28,19 @@ def ocr_pdf():
         
         result = subprocess.run([
             "ocrmypdf",
-            "-l", "por",
+            "-l", "por+eng",
             "--force-ocr",
+            "--oversample", "300",
+            "--rotate-pages",
             "--deskew",
             "--clean",
             "--clean-final",
             "--optimize", "3",
             "--output-type", "pdfa",
+            "--pdf-renderer", "sandwich",
             "--jobs", "4",
             "--tesseract-oem", "1",
-            "--tesseract-pagesegmode", "6",
+            "--tesseract-pagesegmode", "12",
             unsigned_path,
             output_path
         ])
