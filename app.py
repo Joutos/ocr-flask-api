@@ -1,7 +1,8 @@
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, request, jsonify, send_file, after_this_request
 import subprocess
 import tempfile
 import os
+import shutil
 
 app = Flask(__name__)
 
@@ -15,18 +16,20 @@ def ocr_pdf():
     if not file.filename.lower().endswith(".pdf"):
         return jsonify({"error": "Apenas arquivos PDF são aceitos"}), 400
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        input_path = os.path.join(tmpdir, "input.pdf")
-        unsigned_path = os.path.join(tmpdir, "unsigned.pdf")
-        output_path = os.path.join(tmpdir, "output.pdf")
+    tmpdir = tempfile.mkdtemp()
+    input_path = os.path.join(tmpdir, "input.pdf")
+    unsigned_path = os.path.join(tmpdir, "unsigned.pdf")
+    output_path = os.path.join(tmpdir, "output.pdf")
+
+    try:
         file.save(input_path)
 
-        result = subprocess.run([
-            "qpdf", "--remove-restrictions",
-            input_path, unsigned_path
-        ])
-        
-        result = subprocess.run([
+        subprocess.run(
+            ["qpdf", "--remove-restrictions", input_path, unsigned_path],
+            check=True
+        )
+
+        subprocess.run([
             "ocrmypdf",
             "-l", "por+eng",
             "--force-ocr",
@@ -43,12 +46,18 @@ def ocr_pdf():
             "--tesseract-pagesegmode", "12",
             unsigned_path,
             output_path
-        ])
+        ], check=True)
 
-        if result.returncode != 0:
-            return jsonify({"error": "Falha ao processar o PDF"}), 500
+    except subprocess.CalledProcessError:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        return jsonify({"error": "Falha ao processar o PDF"}), 500
 
-        return send_file(output_path, mimetype="application/pdf")
+    @after_this_request
+    def cleanup(response):
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        return response
+
+    return send_file(output_path, mimetype="application/pdf")
 
 
 if __name__ == "__main__":
