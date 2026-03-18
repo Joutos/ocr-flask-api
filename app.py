@@ -1,20 +1,25 @@
-from flask import Flask, request, jsonify, send_file, after_this_request
+import os
 import subprocess
 import tempfile
-import os
-import shutil
+import logging
+from flask import Flask, request, jsonify, send_file
+from werkzeug.utils import secure_filename
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
+app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024
 
 @app.route("/ocr", methods=["POST"])
 def ocr_pdf():
     if "file" not in request.files:
-        return jsonify({"error": "Envie um arquivo PDF com o campo 'file'"}), 400
+        return jsonify({"error": "Campo 'file' ausente"}), 400
 
     file = request.files["file"]
-    if not file.filename.lower().endswith(".pdf"):
-        return jsonify({"error": "Apenas arquivos PDF são aceitos"}), 400
+    if not file or not file.filename.lower().endswith(".pdf"):
+        return jsonify({"error": "Apenas PDF permitido"}), 400
 
     tmpdir = tempfile.mkdtemp()
     input_path = os.path.join(tmpdir, "input.pdf")
@@ -46,19 +51,23 @@ def ocr_pdf():
             "--tesseract-pagesegmode", "12",
             unsigned_path,
             output_path
-        ], check=True)
+        ], check=True, capture_output=True)
 
-    except subprocess.CalledProcessError:
-        shutil.rmtree(tmpdir, ignore_errors=True)
-        return jsonify({"error": "Falha ao processar o PDF"}), 500
+        return send_file(
+            output_path,
+            mimetype='application/pdf',
+            as_attachment=True,
+            download_name=f'ocr_{secure_filename(file.filename)}'
+        )
 
-    @after_this_request
-    def cleanup(response):
-        shutil.rmtree(tmpdir, ignore_errors=True)
-        return response
-
-    return send_file(output_path, mimetype="application/pdf")
-
+    except subprocess.CalledProcessError as e:
+        error_msg = e.stderr.decode() if e.stderr else "Erro desconhecido"
+        logger.error(f"Erro no OCR: {error_msg}")
+        return jsonify({"error": "Falha no processamento", "details": error_msg[:500]}), 500
+    
+    except Exception as e:
+        logger.error(f"Erro inesperado: {str(e)}")
+        return jsonify({"error": "Erro interno", "message": str(e)}), 500
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
