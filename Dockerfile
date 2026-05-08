@@ -18,7 +18,6 @@ RUN pip install --no-cache-dir \
 WORKDIR /app
 COPY app.py .
 
-# ⚡ usa tmpfs do sistema (mais rápido que disco)
 ENV TMPDIR=/tmp
 
 EXPOSE 8080

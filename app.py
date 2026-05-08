@@ -8,7 +8,8 @@ import gzip
 import threading
 from flask import Flask, request, jsonify, send_file
 from werkzeug.utils import secure_filename
-from multiprocessing import Process, Queue, Manager
+from queue import Queue
+from threading import Thread
 import time
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -23,8 +24,8 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024
 
-task_queue = None
-job_status = None
+task_queue = Queue()
+job_status = {}
 
 
 def worker(q, status_dict):
@@ -76,14 +77,7 @@ def worker(q, status_dict):
                 output_path
             ], check=True, capture_output=True)
 
-            gz_path = output_path + ".gz"
-            with open(output_path, 'rb') as f_in:
-                with gzip.open(gz_path, 'wb') as f_out:
-                    shutil.copyfileobj(f_in, f_out)
-
-            os.remove(output_path)
-
-            logger.info(f"Task {task_id} concluída. Arquivo: {gz_path}")
+            logger.info(f"Task {task_id} concluída. Arquivo: {output_path}")
             status_dict[task_id] = "completed"
 
         except subprocess.CalledProcessError as e:
@@ -144,7 +138,7 @@ def get_status(task_id):
 
 @app.route("/download/<task_id>", methods=["GET"])
 def download_result(task_id):
-    path = os.path.join(OUTPUT_FOLDER, f"{task_id}.pdf.gz")
+    path = os.path.join(OUTPUT_FOLDER, f"{task_id}.pdf")
     logger.info(
         f"Download solicitado. Path: {path} | Existe: {os.path.exists(path)}")
 
@@ -195,9 +189,6 @@ def schedule_cleanup(job_status):
 
 
 if __name__ == "__main__":
-    manager = Manager()
-    task_queue = Queue()
-    job_status = manager.dict()
     job_status["cleanup_mode"] = False
 
     cleanup_thread = threading.Thread(
@@ -207,9 +198,9 @@ if __name__ == "__main__":
     )
     cleanup_thread.start()
 
-    for i in range(3):
-        p = Process(target=worker, args=(task_queue, job_status))
-        p.start()
-        logger.info(f"Worker {i+1} iniciado. PID: {p.pid}")
+for i in range(3):
+    t = Thread(target=worker, args=(task_queue, job_status), daemon=True)
+    t.start()
+    logger.info(f"Worker thread {i+1} iniciada")
 
     app.run(host="0.0.0.0", port=8080, debug=False)
