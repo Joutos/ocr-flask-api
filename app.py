@@ -3,8 +3,19 @@ import subprocess
 import tempfile
 import logging
 import shutil
+import uuid
+import gzip
+import threading
 from flask import Flask, request, jsonify, send_file
 from werkzeug.utils import secure_filename
+from multiprocessing import Process, Queue, Manager
+import time
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+UPLOAD_FOLDER = os.path.join(BASE_DIR, "ocr_storage", "uploads")
+OUTPUT_FOLDER = os.path.join(BASE_DIR, "ocr_storage", "completed")
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -12,65 +23,193 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024
 
+task_queue = None
+job_status = None
+
+
+def worker(q, status_dict):
+    logger.info(f"Worker iniciado. PID: {os.getpid()}")
+
+    while True:
+
+        if status_dict.get("cleanup_mode"):
+            time.sleep(1)
+            continue
+
+        task = q.get()
+
+        if task is None:
+            break
+
+        if not isinstance(task, tuple) or len(task) != 2:
+            logger.error(f"Task inválida: {task}")
+            continue
+
+        task_id, original_filename = task
+
+        logger.info(f"Worker recebeu task: {task_id}")
+
+        input_path = os.path.join(UPLOAD_FOLDER, f"{task_id}.pdf")
+        output_path = os.path.join(OUTPUT_FOLDER, f"{task_id}.pdf")
+        unsigned_path = input_path + ".unsigned"
+
+        status_dict[task_id] = "processing"
+
+        try:
+            subprocess.run(
+                ["qpdf", "--remove-restrictions", input_path, unsigned_path],
+                check=True, capture_output=True
+            )
+
+            jobs = max(1, (os.cpu_count() or 2) // 2)
+
+            subprocess.run([
+                "ocrmypdf",
+                "-l", "por+eng",
+                "--force-ocr",
+                "--rotate-pages",
+                "--optimize", "1",
+                "--output-type", "pdfa",
+                "--pdf-renderer", "sandwich",
+                "--jobs", str(jobs),
+                unsigned_path,
+                output_path
+            ], check=True, capture_output=True)
+
+            gz_path = output_path + ".gz"
+            with open(output_path, 'rb') as f_in:
+                with gzip.open(gz_path, 'wb') as f_out:
+                    shutil.copyfileobj(f_in, f_out)
+
+            os.remove(output_path)
+
+            logger.info(f"Task {task_id} concluída. Arquivo: {gz_path}")
+            status_dict[task_id] = "completed"
+
+        except subprocess.CalledProcessError as e:
+            error_msg = e.stderr.decode(
+                errors="ignore") if e.stderr else "Subprocess failed"
+            logger.error(f"OCR Error para {task_id}: {error_msg}")
+            status_dict[task_id] = f"failed: {error_msg[:200]}"
+
+        except Exception as e:
+            logger.error(f"Erro inesperado no worker: {str(e)}")
+            status_dict[task_id] = f"failed: {str(e)}"
+
+        finally:
+            if os.path.exists(input_path):
+                os.remove(input_path)
+            if os.path.exists(unsigned_path):
+                os.remove(unsigned_path)
+
+
 @app.route("/ocr", methods=["POST"])
-def ocr_pdf():
+def enqueue_ocr():
+    global task_queue, job_status
+
     if "file" not in request.files:
-        return jsonify({"error": "Campo 'file' ausente"}), 400
+        return jsonify({"error": "No file uploaded"}), 400
 
     file = request.files["file"]
+    if not file.filename.lower().endswith(".pdf"):
+        return jsonify({"error": "Only PDF allowed"}), 400
 
-    if not file or not file.filename.lower().endswith(".pdf"):
-        return jsonify({"error": "Apenas PDF permitido"}), 400
+    task_id = str(uuid.uuid4())
+    save_path = os.path.join(UPLOAD_FOLDER, f"{task_id}.pdf")
+    file.save(save_path)
 
-    tmpdir = tempfile.mkdtemp()
+    job_status[task_id] = "queued"
+    task_queue.put((task_id, secure_filename(file.filename)))
+    logger.info(f"Task enfileirada: {task_id}")
 
-    input_path = os.path.join(tmpdir, "input.pdf")
-    unsigned_path = os.path.join(tmpdir, "unsigned.pdf")
-    output_path = os.path.join(tmpdir, "output.pdf")
+    return jsonify({
+        "task_id":   task_id,
+        "status":    "queued",
+        "check_url": f"/status/{task_id}"
+    }), 202
 
-    try:
-        file.save(input_path)
 
-        subprocess.run(
-            ["qpdf", "--remove-restrictions", input_path, unsigned_path],
-            check=True
-        )
+@app.route("/status/<task_id>", methods=["GET"])
+def get_status(task_id):
+    status = job_status.get(task_id, "not_found")
 
-        jobs = max(1, os.cpu_count() // 2)
+    if status == "completed":
+        return jsonify({
+            "status":       status,
+            "download_url": f"/download/{task_id}"
+        })
 
-        subprocess.run([
-            "ocrmypdf",
-            "-l", "por+eng",
-            "--force-ocr",
-            "--rotate-pages",
-            "--optimize", "1", 
-            "--output-type", "pdfa",
-            "--pdf-renderer", "sandwich",
-            "--jobs", str(jobs), 
-            "--tesseract-oem", "1",
-            "--tesseract-pagesegmode", "12",
-            unsigned_path,
-            output_path
-        ], check=True)
+    return jsonify({"status": status})
 
-        return send_file(
-            output_path,
-            mimetype='application/pdf',
-            as_attachment=True,
-            download_name=f'ocr_{secure_filename(file.filename)}'
-        )
 
-    except subprocess.CalledProcessError as e:
-        error_msg = e.stderr.decode() if e.stderr else "Erro desconhecido"
-        logger.error(f"Erro no OCR: {error_msg}")
-        return jsonify({"error": "Falha no processamento", "details": error_msg[:500]}), 500
+@app.route("/download/<task_id>", methods=["GET"])
+def download_result(task_id):
+    path = os.path.join(OUTPUT_FOLDER, f"{task_id}.pdf.gz")
+    logger.info(
+        f"Download solicitado. Path: {path} | Existe: {os.path.exists(path)}")
 
-    except Exception as e:
-        logger.error(f"Erro inesperado: {str(e)}")
-        return jsonify({"error": "Erro interno", "message": str(e)}), 500
+    if os.path.exists(path):
+        return send_file(path, as_attachment=True, download_name=f"ocr_result_{task_id}.pdf")
 
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
+    return jsonify({"error": "File not found or still processing"}), 404
+
+
+def clear_old_files():
+    for folder in [OUTPUT_FOLDER]:
+        files = os.listdir(folder)
+        logger.info(f"Iniciando limpeza. Total de arquivos: {len(files)}")
+
+        for filename in files:
+            file_path = os.path.join(folder, filename)
+
+            if not os.path.isfile(file_path):
+                continue
+            try:
+                os.remove(file_path)
+                logger.info(f"Removido: {file_path}")
+            except Exception as e:
+                logger.error(f"Erro ao remover {file_path}: {e}")
+
+        remaining = os.listdir(folder)
+        logger.info(f"Restaram {len(remaining)} arquivos após limpeza")
+
+
+def blocking_cleanup(job_status):
+    logger.info("Iniciando modo de limpeza...")
+
+    job_status["cleanup_mode"] = True
+
+    logger.info("Aguardando 5 minutos antes da limpeza...")
+    time.sleep(300)
+
+    clear_old_files()
+
+    job_status["cleanup_mode"] = False
+    logger.info("Limpeza finalizada, processamento liberado.")
+
+
+def schedule_cleanup(job_status):
+    while True:
+        time.sleep(1500)
+        blocking_cleanup(job_status)
+
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8080)
+    manager = Manager()
+    task_queue = Queue()
+    job_status = manager.dict()
+    job_status["cleanup_mode"] = False
+
+    cleanup_thread = threading.Thread(
+        target=schedule_cleanup,
+        args=(job_status,),
+        daemon=True
+    )
+    cleanup_thread.start()
+
+    for i in range(3):
+        p = Process(target=worker, args=(task_queue, job_status))
+        p.start()
+        logger.info(f"Worker {i+1} iniciado. PID: {p.pid}")
+
+    app.run(host="0.0.0.0", port=8080, debug=False)
