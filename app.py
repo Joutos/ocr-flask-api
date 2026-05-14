@@ -123,6 +123,10 @@ def enqueue_ocr():
     }), 202
 
 
+@app.route("/status/", methods=["GET"])
+def get_all_status():
+    return jsonify(job_status)
+
 @app.route("/status/<task_id>", methods=["GET"])
 def get_status(task_id):
     status = job_status.get(task_id, "not_found")
